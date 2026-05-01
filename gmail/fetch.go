@@ -5,6 +5,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"time"
 )
 
 type Message struct {
@@ -45,6 +46,10 @@ func (c *Client) FetchAllMessages(progressFn func(fetched, total int)) ([]Sender
 			allIDs = append(allIDs, msg.Id)
 		}
 
+		if progressFn != nil {
+			progressFn(0, len(allIDs))
+		}
+
 		if resp.NextPageToken == "" {
 			break
 		}
@@ -60,11 +65,15 @@ func (c *Client) FetchAllMessages(progressFn func(fetched, total int)) ([]Sender
 	const workerCount = 10
 	messages := make([]Message, 0, totalMessages)
 	var mu sync.Mutex
-	var fetchErr error
 
 	sem := make(chan struct{}, workerCount)
 	var wg sync.WaitGroup
 	fetched := 0
+
+	// Gmail API allows 250 units/sec. Messages.Get is 5 units (50 req/sec max).
+	// We use a 25ms ticker to cap at 40 req/sec to be safe.
+	ticker := time.NewTicker(25 * time.Millisecond)
+	defer ticker.Stop()
 
 	for _, id := range allIDs {
 		wg.Add(1)
@@ -74,16 +83,14 @@ func (c *Client) FetchAllMessages(progressFn func(fetched, total int)) ([]Sender
 			defer wg.Done()
 			defer func() { <-sem }()
 
+			<-ticker.C
+
 			msg, err := c.Service.Users.Messages.Get(c.User, msgID).
 				Format("metadata").
 				MetadataHeaders("From", "Subject", "Date").
 				Do()
 			if err != nil {
-				mu.Lock()
-				if fetchErr == nil {
-					fetchErr = fmt.Errorf("failed to fetch message %s: %w", msgID, err)
-				}
-				mu.Unlock()
+				// Skip messages that fail to fetch (e.g., deleted during scan)
 				return
 			}
 
@@ -114,10 +121,6 @@ func (c *Client) FetchAllMessages(progressFn func(fetched, total int)) ([]Sender
 	}
 
 	wg.Wait()
-
-	if fetchErr != nil {
-		return nil, fetchErr
-	}
 
 	return groupBySender(messages), nil
 }

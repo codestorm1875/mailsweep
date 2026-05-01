@@ -15,9 +15,11 @@ type LeaderboardModel struct {
 	email   string
 	cursor  int
 	maxSize int64
+	width   int
+	height  int
 }
 
-func NewLeaderboardModel(senders []gmailpkg.SenderGroup, email string) LeaderboardModel {
+func NewLeaderboardModel(senders []gmailpkg.SenderGroup, email string, width, height int) LeaderboardModel {
 	var maxSize int64
 	if len(senders) > 0 {
 		maxSize = senders[0].TotalSize
@@ -27,7 +29,14 @@ func NewLeaderboardModel(senders []gmailpkg.SenderGroup, email string) Leaderboa
 		email:   email,
 		cursor:  0,
 		maxSize: maxSize,
+		width:   width,
+		height:  height,
 	}
+}
+
+func (m *LeaderboardModel) SetSize(width, height int) {
+	m.width = width
+	m.height = height
 }
 
 func (m LeaderboardModel) SelectedIndex() int {
@@ -73,7 +82,26 @@ func (m LeaderboardModel) View() string {
 		"#", "Sender", "Emails", "Size", "Bar")
 	b.WriteString(headerStyle.Render(header) + "\n")
 
-	for i, s := range m.senders {
+	pageSize := m.height - 8
+	if pageSize < 5 {
+		pageSize = 5
+	}
+
+	start := m.cursor - (pageSize / 2)
+	if start < 0 {
+		start = 0
+	}
+	end := start + pageSize
+	if end > len(m.senders) {
+		end = len(m.senders)
+		start = end - pageSize
+		if start < 0 {
+			start = 0
+		}
+	}
+
+	for i := start; i < end; i++ {
+		s := m.senders[i]
 		rank := fmt.Sprintf("%-4d", i+1)
 		sender := truncate(s.Email, 35)
 		emails := fmt.Sprintf("%d", s.Count)

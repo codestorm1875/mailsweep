@@ -14,14 +14,23 @@ type DrilldownModel struct {
 	sender   gmailpkg.SenderGroup
 	cursor   int
 	selected map[int]bool
+	width    int
+	height   int
 }
 
-func NewDrilldownModel(sender gmailpkg.SenderGroup) DrilldownModel {
+func NewDrilldownModel(sender gmailpkg.SenderGroup, width, height int) DrilldownModel {
 	return DrilldownModel{
 		sender:   sender,
 		cursor:   0,
 		selected: make(map[int]bool),
+		width:    width,
+		height:   height,
 	}
+}
+
+func (m *DrilldownModel) SetSize(width, height int) {
+	m.width = width
+	m.height = height
 }
 
 func (m DrilldownModel) SelectedMessages() []gmailpkg.Message {
@@ -77,7 +86,26 @@ func (m DrilldownModel) View() string {
 	header := fmt.Sprintf("     %-40s %-14s %8s", "Subject", "Date", "Size")
 	b.WriteString(headerStyle.Render(header) + "\n")
 
-	for i, msg := range m.sender.Messages {
+	pageSize := m.height - 7
+	if pageSize < 5 {
+		pageSize = 5
+	}
+
+	start := m.cursor - (pageSize / 2)
+	if start < 0 {
+		start = 0
+	}
+	end := start + pageSize
+	if end > len(m.sender.Messages) {
+		end = len(m.sender.Messages)
+		start = end - pageSize
+		if start < 0 {
+			start = 0
+		}
+	}
+
+	for i := start; i < end; i++ {
+		msg := m.sender.Messages[i]
 		checkbox := uncheckedStyle.Render("[ ]")
 		if m.selected[i] {
 			checkbox = checkedStyle.Render("[x]")

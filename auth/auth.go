@@ -24,7 +24,40 @@ func GetGmailClient() (*gmail.Service, string, error) {
 
 	credPath, err := findCredentials()
 	if err != nil {
-		return nil, "", fmt.Errorf("credentials.json not found: %w\n\nTo set up:\n1. Go to https://console.cloud.google.com\n2. Create a project and enable the Gmail API\n3. Create OAuth2 credentials (Desktop app)\n4. Download credentials.json to ~/.mailsweep/ or the current directory", err)
+		return nil, "", fmt.Errorf(`credentials.json not found
+
+mailsweep needs a Google Cloud credentials file to access your Gmail.
+Head to console.cloud.google.com and follow these steps:
+
+1. Create a Google Cloud project
+   Click the project dropdown (top left) → "New Project"
+   Name it "mailsweep" → hit Create
+
+2. Enable the Gmail API
+   Navigate to APIs & Services → Library
+   Search for "Gmail API" → select it → click Enable
+
+3. Set up the OAuth consent screen
+   Go to APIs & Services → OAuth consent screen
+   - Select "External" as the user type → click Create
+   - Set the app name to "mailsweep"
+   - Enter your email address in both the "User support email" and
+     "Developer contact" fields → Save and Continue
+   - Skip the Scopes step → Save and Continue
+   - Under Test Users, add your Gmail address → Save and Continue
+
+4. Create your OAuth credentials
+   Go to APIs & Services → Credentials
+   - Click "+ Create Credentials" → choose "OAuth client ID"
+   - Set application type to "Desktop app"
+   - Give it any name → click Create
+   - Download the JSON file from the dialog that appears
+
+5. Move the credentials file into place
+   mkdir -p ~/.mailsweep
+   mv ~/Downloads/client_secret_*.json ~/.mailsweep/credentials.json
+
+Once that's done, run mailsweep again.`)
 	}
 
 	b, err := os.ReadFile(credPath)
@@ -162,3 +195,4 @@ func saveToken(path string, token *oauth2.Token) error {
 
 	return json.NewEncoder(f).Encode(token)
 }
+	

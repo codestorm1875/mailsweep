@@ -10,6 +10,11 @@ func renderLoading(fetched, total int) string {
 		return fmt.Sprintf("\n%s\n\n%s\n", title, spinner)
 	}
 
+	if fetched == 0 {
+		spinner := statusStyle.Render(fmt.Sprintf("⏳ Scanning your mailbox... found %d emails so far", total))
+		return fmt.Sprintf("\n%s\n\n%s\n", title, spinner)
+	}
+
 	pct := float64(fetched) / float64(total) * 100
 	progress := statusStyle.Render(
 		fmt.Sprintf("⏳ Fetching email metadata... %d / %d (%.0f%%)", fetched, total, pct))
