@@ -2,16 +2,19 @@ package tui
 
 import "fmt"
 
-func renderLoading(fetched, total int) string {
+func renderLoading(message string, fetched, total int) string {
 	title := titleStyle.Render("mailsweep")
+	if message == "" {
+		message = "Scanning your mailbox..."
+	}
 
 	if total == 0 {
-		spinner := statusStyle.Render("⏳ Scanning your mailbox...")
+		spinner := statusStyle.Render("⏳ " + message)
 		return fmt.Sprintf("\n%s\n\n%s\n", title, spinner)
 	}
 
 	if fetched == 0 {
-		spinner := statusStyle.Render(fmt.Sprintf("⏳ Scanning your mailbox... found %d emails so far", total))
+		spinner := statusStyle.Render(fmt.Sprintf("⏳ %s found %d emails so far", message, total))
 		return fmt.Sprintf("\n%s\n\n%s\n", title, spinner)
 	}
 

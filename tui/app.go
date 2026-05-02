@@ -2,7 +2,7 @@ package tui
 
 import (
 	"fmt"
-	
+
 	tea "github.com/charmbracelet/bubbletea"
 
 	gmailpkg "github.com/codestorm1875/mailsweep/gmail"
@@ -12,22 +12,30 @@ import (
 type AppState int
 
 const (
-	StateLoading     AppState = iota
+	StateLoading AppState = iota
 	StateLeaderboard
 	StateDrilldown
 	StateConfirm
 )
 
 type App struct {
-	state   AppState
-	client  *gmailpkg.Client
-	email   string
-	senders []gmailpkg.SenderGroup
-	err     error
+	state          AppState
+	client         *gmailpkg.Client
+	email          string
+	snapshot       gmailpkg.MailboxSnapshot
+	prefs          gmailpkg.Preferences
+	senders        []gmailpkg.SenderGroup
+	err            error
+	loadingText    string
+	prefetched     map[string]gmailpkg.SenderGroup
+	prefetching    map[string]bool
+	prefetchLRU    []string
+	prefetchWanted map[string]bool
 
 	leaderboard LeaderboardModel
 	drilldown   DrilldownModel
 	confirm     ConfirmModel
+	confirmBack AppState
 
 	fetched  int
 	total    int
@@ -40,20 +48,29 @@ type App struct {
 func NewApp(service *gmail.Service, email string) App {
 	client := gmailpkg.NewClient(service)
 	return App{
-		state:    StateLoading,
-		client:   client,
-		email:    email,
-		progress: make(chan progressMsg, 100),
+		state:          StateLoading,
+		client:         client,
+		email:          email,
+		progress:       make(chan progressMsg, 100),
+		prefetched:     make(map[string]gmailpkg.SenderGroup),
+		prefetching:    make(map[string]bool),
+		prefetchWanted: make(map[string]bool),
 	}
 }
 
+const senderPrefetchWindow = 3
+const senderPrefetchCacheLimit = 8
+
 func (a App) Init() tea.Cmd {
-	if senders, err := gmailpkg.LoadCache(); err == nil && len(senders) > 0 {
+	if prefs, err := gmailpkg.LoadPreferences(); err == nil {
+		a.prefs = prefs
+	}
+	if snapshot, err := gmailpkg.LoadCache(); err == nil && (len(snapshot.Senders) > 0 || snapshot.HistoryID != "" || !snapshot.ScannedAt.IsZero()) {
 		return func() tea.Msg {
-			return fetchDoneMsg{senders: senders, err: nil}
+			return fetchDoneMsg{snapshot: snapshot, prefs: a.prefs, err: nil}
 		}
 	}
-	return tea.Batch(a.fetchEmails(), waitForProgress(a.progress))
+	return tea.Batch(a.syncEmails(), waitForProgress(a.progress))
 }
 
 func waitForProgress(c chan progressMsg) tea.Cmd {
@@ -79,18 +96,87 @@ func (a App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		a.drilldown.SetSize(msg.Width, msg.Height)
 		return a, nil
 	case fetchDoneMsg:
-		a.senders = msg.senders
+		a.snapshot = msg.snapshot
+		a.prefs = msg.prefs
+		a.senders = msg.snapshot.Senders
 		a.err = msg.err
-		if a.err == nil && len(a.senders) > 0 {
-			_ = gmailpkg.SaveCache(a.senders)
+		a.fetched = 0
+		a.total = 0
+		a.loadingText = ""
+		a.prefetched = make(map[string]gmailpkg.SenderGroup)
+		a.prefetching = make(map[string]bool)
+		a.prefetchLRU = nil
+		a.prefetchWanted = make(map[string]bool)
+		if a.err == nil {
+			_ = gmailpkg.SaveCache(a.snapshot)
 		}
 		a.state = StateLeaderboard
-		a.leaderboard = NewLeaderboardModel(a.senders, a.email, a.width, a.height)
-		return a, nil
+		a.leaderboard = NewLeaderboardModel(a.snapshot, a.email, a.width, a.height)
+		a.leaderboard.ApplyPreferences(a.prefs.SortMode, a.prefs.FilterQuery)
+		return a, a.prefetchVisibleSenders()
 	case progressMsg:
 		a.fetched = msg.fetched
 		a.total = msg.total
 		return a, waitForProgress(a.progress)
+	case deleteResultMsg:
+		a.err = msg.err
+		a.fetched = 0
+		a.total = 0
+		a.loadingText = ""
+		a.prefetched = make(map[string]gmailpkg.SenderGroup)
+		a.prefetching = make(map[string]bool)
+		a.prefetchLRU = nil
+		a.prefetchWanted = make(map[string]bool)
+		if a.err != nil {
+			a.state = StateDrilldown
+			return a, nil
+		}
+
+		a.snapshot = gmailpkg.UpdateSnapshotAfterDelete(a.snapshot, msg.ids)
+		a.senders = a.snapshot.Senders
+		_ = gmailpkg.SaveCache(a.snapshot)
+		a.leaderboard = NewLeaderboardModel(a.snapshot, a.email, a.width, a.height)
+		a.leaderboard.ApplyPreferences(a.prefs.SortMode, a.prefs.FilterQuery)
+		a.state = StateLeaderboard
+		return a, nil
+	case senderLoadedMsg:
+		a.err = msg.err
+		if a.err != nil {
+			delete(a.prefetching, msg.email)
+			if msg.activate {
+				a.fetched = 0
+				a.total = 0
+				a.loadingText = ""
+				a.state = StateLeaderboard
+			}
+			return a, nil
+		}
+		delete(a.prefetching, msg.email)
+		if msg.activate || a.prefetchWanted[msg.email] {
+			a.rememberPrefetched(msg.email, msg.sender)
+		}
+		if msg.activate {
+			a.fetched = 0
+			a.total = 0
+			a.loadingText = ""
+			a.drilldown = NewDrilldownModel(msg.sender, a.width, a.height)
+			a.state = StateDrilldown
+		}
+		return a, nil
+	case senderDeleteReadyMsg:
+		a.err = msg.err
+		a.fetched = 0
+		a.total = 0
+		a.loadingText = ""
+		if a.err != nil {
+			a.state = StateLeaderboard
+			return a, nil
+		}
+		a.rememberPrefetched(msg.sender.Email, msg.sender)
+		a.confirm = NewConfirmModelWithAge(msg.sender, msg.sender.Messages, AgeFilter(a.prefs.LastAgeFilter))
+		a.confirmBack = StateLeaderboard
+		a.state = StateConfirm
+		return a, nil
 	}
 
 	switch a.state {
@@ -125,8 +211,9 @@ func (a App) View() string {
 }
 
 type fetchDoneMsg struct {
-	senders []gmailpkg.SenderGroup
-	err     error
+	snapshot gmailpkg.MailboxSnapshot
+	prefs    gmailpkg.Preferences
+	err      error
 }
 
 type progressMsg struct {
@@ -135,18 +222,31 @@ type progressMsg struct {
 }
 
 type deleteResultMsg struct {
+	ids []string
 	err error
 }
 
-func (a *App) fetchEmails() tea.Cmd {
+type senderLoadedMsg struct {
+	email    string
+	sender   gmailpkg.SenderGroup
+	err      error
+	activate bool
+}
+
+type senderDeleteReadyMsg struct {
+	sender gmailpkg.SenderGroup
+	err    error
+}
+
+func (a *App) syncEmails() tea.Cmd {
 	return func() tea.Msg {
-		senders, err := a.client.FetchAllMessages(func(fetched, total int) {
+		snapshot, err := a.client.SyncMailbox(a.snapshot, func(fetched, total int) {
 			select {
 			case a.progress <- progressMsg{fetched: fetched, total: total}:
 			default:
 			}
 		})
-		return fetchDoneMsg{senders: senders, err: err}
+		return fetchDoneMsg{snapshot: snapshot, prefs: a.prefs, err: err}
 	}
 }
 
@@ -158,22 +258,49 @@ func (a App) updateLeaderboard(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return a, tea.Quit
 		case "enter":
 			if idx := a.leaderboard.SelectedIndex(); idx >= 0 && idx < len(a.senders) {
-				a.state = StateDrilldown
-				a.drilldown = NewDrilldownModel(a.senders[idx], a.width, a.height)
+				sender := a.senders[idx]
+				if prefetched, ok := a.prefetched[sender.Email]; ok {
+					a.touchPrefetched(sender.Email)
+					a.drilldown = NewDrilldownModel(prefetched, a.width, a.height)
+					a.state = StateDrilldown
+					return a, nil
+				}
+				return a.startDrilldownLoad(sender)
+			}
+			return a, nil
+		case "D":
+			if idx := a.leaderboard.SelectedIndex(); idx >= 0 && idx < len(a.senders) {
+				sender := a.senders[idx]
+				if prefetched, ok := a.prefetched[sender.Email]; ok {
+					a.touchPrefetched(sender.Email)
+					a.confirm = NewConfirmModelWithAge(prefetched, prefetched.Messages, AgeFilter(a.prefs.LastAgeFilter))
+					a.confirmBack = StateLeaderboard
+					a.state = StateConfirm
+					return a, nil
+				}
+				return a.startSenderDeleteLoad(sender)
 			}
 			return a, nil
 		case "r":
 			a.state = StateLoading
+			a.fetched = 0
+			a.total = 0
+			a.loadingText = "Refreshing mailbox..."
 			// Clear any stale progress messages
 			for len(a.progress) > 0 {
 				<-a.progress
 			}
-			return a, tea.Batch(a.fetchEmails(), waitForProgress(a.progress))
+			return a, tea.Batch(a.syncEmails(), waitForProgress(a.progress))
 		}
 	}
 
 	var cmd tea.Cmd
+	prevIdx := a.leaderboard.SelectedIndex()
 	a.leaderboard, cmd = a.leaderboard.Update(msg)
+	a.savePreferencesFromUI()
+	if a.leaderboard.SelectedIndex() != prevIdx {
+		return a, tea.Batch(cmd, a.prefetchVisibleSenders())
+	}
 	return a, cmd
 }
 
@@ -188,7 +315,8 @@ func (a App) updateDrilldown(msg tea.Msg) (tea.Model, tea.Cmd) {
 			selected := a.drilldown.SelectedMessages()
 			if len(selected) > 0 {
 				a.state = StateConfirm
-				a.confirm = NewConfirmModel(a.drilldown.sender, selected)
+				a.confirm = NewConfirmModelWithAge(a.drilldown.sender, selected, AgeFilter(a.prefs.LastAgeFilter))
+				a.confirmBack = StateDrilldown
 			}
 			return a, nil
 		}
@@ -204,42 +332,175 @@ func (a App) updateConfirm(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.KeyMsg:
 		switch msg.String() {
 		case "y", "Y":
-			ids := make([]string, len(a.confirm.messages))
-			for i, m := range a.confirm.messages {
-				ids[i] = m.ID
-			}
-			a.state = StateLoading
-			return a, func() tea.Msg {
-				err := a.client.BatchDelete(ids)
-				if err != nil {
-					return deleteResultMsg{err: err}
-				}
-				// Re-scan the mailbox after deleting
-				for len(a.progress) > 0 {
-					<-a.progress
-				}
-				senders, fetchErr := a.client.FetchAllMessages(func(fetched, total int) {
-					select {
-					case a.progress <- progressMsg{fetched: fetched, total: total}:
-					default:
-					}
-				})
-				return fetchDoneMsg{senders: senders, err: fetchErr}
-			}
+			return a.startDelete()
 		case "n", "N", "esc":
-			a.state = StateDrilldown
+			a.state = a.confirmBack
+			return a, nil
+		case "enter":
+			if a.confirm.cursor == 0 {
+				return a.startDelete()
+			}
+			a.state = a.confirmBack
 			return a, nil
 		}
 	}
 
 	var cmd tea.Cmd
 	a.confirm, cmd = a.confirm.Update(msg)
+	a.savePreferencesFromUI()
 	return a, cmd
 }
 
-func (a App) viewLoading() string {
-	if a.total > 0 {
-		return renderLoading(a.fetched, a.total)
+func (a App) startDelete() (tea.Model, tea.Cmd) {
+	filtered := a.confirm.FilteredMessages()
+	ids := make([]string, len(filtered))
+	for i, m := range filtered {
+		ids[i] = m.ID
 	}
-	return renderLoading(0, 0)
+	a.state = StateLoading
+	a.fetched = 0
+	a.total = 0
+	a.loadingText = "Moving selected emails to Trash..."
+	return a, func() tea.Msg {
+		err := a.client.BatchDelete(ids)
+		return deleteResultMsg{ids: ids, err: err}
+	}
+}
+
+func (a App) startDrilldownLoad(sender gmailpkg.SenderGroup) (tea.Model, tea.Cmd) {
+	if prefetched, ok := a.prefetched[sender.Email]; ok {
+		a.touchPrefetched(sender.Email)
+		a.drilldown = NewDrilldownModel(prefetched, a.width, a.height)
+		a.state = StateDrilldown
+		return a, nil
+	}
+
+	a.state = StateLoading
+	a.fetched = 0
+	a.total = 0
+	a.loadingText = fmt.Sprintf("Loading messages from %s...", sender.Email)
+	return a, func() tea.Msg {
+		hydrated, err := a.hydrateSender(sender)
+		if err != nil {
+			return senderLoadedMsg{email: sender.Email, err: err, activate: true}
+		}
+		return senderLoadedMsg{email: sender.Email, sender: hydrated, activate: true}
+	}
+}
+
+func (a App) startSenderDeleteLoad(sender gmailpkg.SenderGroup) (tea.Model, tea.Cmd) {
+	a.state = StateLoading
+	a.fetched = 0
+	a.total = 0
+	a.loadingText = fmt.Sprintf("Loading messages from %s...", sender.Email)
+	return a, func() tea.Msg {
+		hydrated, err := a.hydrateSender(sender)
+		if err != nil {
+			return senderDeleteReadyMsg{err: err}
+		}
+		return senderDeleteReadyMsg{sender: hydrated}
+	}
+}
+
+func (a App) prefetchVisibleSenders() tea.Cmd {
+	ordered := a.leaderboard.PrefetchCandidates(senderPrefetchWindow)
+	if len(ordered) == 0 {
+		a.prefetchWanted = make(map[string]bool)
+		return nil
+	}
+	a.prefetchWanted = make(map[string]bool, len(ordered))
+	for _, sender := range ordered {
+		a.prefetchWanted[sender.Email] = true
+	}
+
+	cmds := make([]tea.Cmd, 0, len(ordered))
+	for _, sender := range ordered {
+		if cmd := a.prefetchSender(sender); cmd != nil {
+			cmds = append(cmds, cmd)
+		}
+	}
+	return tea.Batch(cmds...)
+}
+
+func (a App) prefetchSender(sender gmailpkg.SenderGroup) tea.Cmd {
+	if _, ok := a.prefetched[sender.Email]; ok {
+		return nil
+	}
+	if a.prefetching[sender.Email] {
+		return nil
+	}
+
+	a.prefetching[sender.Email] = true
+	return func() tea.Msg {
+		hydrated, err := a.hydrateSender(sender)
+		if err != nil {
+			return senderLoadedMsg{email: sender.Email, err: err}
+		}
+		return senderLoadedMsg{email: sender.Email, sender: hydrated}
+	}
+}
+
+func (a *App) rememberPrefetched(email string, sender gmailpkg.SenderGroup) {
+	a.prefetched[email] = sender
+	for i := range a.senders {
+		if a.senders[i].Email == email {
+			a.senders[i] = sender
+			break
+		}
+	}
+	for i := range a.leaderboard.senders {
+		if a.leaderboard.senders[i].Email == email {
+			a.leaderboard.senders[i] = sender
+			break
+		}
+	}
+	a.touchPrefetched(email)
+
+	for len(a.prefetchLRU) > senderPrefetchCacheLimit {
+		evict := a.prefetchLRU[0]
+		a.prefetchLRU = a.prefetchLRU[1:]
+		if a.prefetching[evict] {
+			a.prefetchLRU = append(a.prefetchLRU, evict)
+			continue
+		}
+		delete(a.prefetched, evict)
+	}
+}
+
+func (a *App) touchPrefetched(email string) {
+	for i, cached := range a.prefetchLRU {
+		if cached == email {
+			a.prefetchLRU = append(a.prefetchLRU[:i], a.prefetchLRU[i+1:]...)
+			break
+		}
+	}
+	a.prefetchLRU = append(a.prefetchLRU, email)
+}
+
+func (a App) viewLoading() string {
+	return renderLoading(a.loadingText, a.fetched, a.total)
+}
+
+func (a App) hydrateSender(sender gmailpkg.SenderGroup) (gmailpkg.SenderGroup, error) {
+	messages, err := a.client.FetchMessagesForSender(sender.Email)
+	if err != nil {
+		return sender, err
+	}
+
+	sender.Messages = messages
+	sender.Count = len(messages)
+	var totalSize int64
+	for _, msg := range messages {
+		totalSize += msg.Size
+	}
+	sender.TotalSize = totalSize
+
+	return sender, nil
+}
+
+func (a *App) savePreferencesFromUI() {
+	a.prefs.SortMode = a.leaderboard.SortMode()
+	a.prefs.FilterQuery = a.leaderboard.FilterQuery()
+	a.prefs.LastAgeFilter = a.confirm.AgeFilter()
+	_ = gmailpkg.SavePreferences(a.prefs)
 }
