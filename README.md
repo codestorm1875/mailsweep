@@ -1,5 +1,3 @@
-# mailsweep
-
 `mailsweep` is a terminal UI for finding the heaviest senders in your Gmail account and bulk-moving mail to Trash safely.
 
 It is optimized for large inboxes:
